@@ -1,108 +1,110 @@
 # macosdragfix
 
-Workaround nativo per il bug di spostamento finestre di macOS 27 (Golden Gate) beta:
-su questa beta il trascinamento delle finestre dalla barra del titolo smette di
-funzionare per le app con chrome "custom" (Electron, Chromium e simili), mentre
-resta ok per le app AppKit native.
+Native workaround for the window-dragging bug in the macOS 27 (Golden Gate) beta:
+on this beta, dragging a window by its title bar stops working for apps with a
+custom chrome (Electron, Chromium, and similar), while native AppKit apps keep
+working.
 
-`macosdragfix` ti permette di spostare qualsiasi finestra trascinandone la fascia
-alta, senza premere tasti, aggirando completamente la gesture rotta.
+`macosdragfix` lets you move any window by dragging its top band, with no
+modifier keys, bypassing the broken gesture entirely.
 
-## Il bug
+## The bug
 
-- Ambiente: macOS 27.x beta (es. build `26B5112a`), Apple Silicon.
-- Sintomo: le finestre non si spostano trascinando la barra del titolo. Il drag
-  delle tab interne funziona, quindi l'input arriva all'OS.
-- Nel log di WindowServer, a ogni tentativo di drag:
+- Environment: macOS 27.x beta (for example build `26B5112a`), Apple Silicon.
+- Symptom: windows do not move when you drag the title bar. Dragging internal
+  tabs still works, so the input is reaching the OS.
+- In the WindowServer log, on every drag attempt:
   `[SkyLight:packages] no client initiated window drag trait gesture to activate for mouse`
-- Si innesca con sessioni di input remoto/virtuale (controllo remoto, Universal
-  Control, Chrome Remote Desktop) e resta finche non si riavvia WindowServer.
-- Colpisce solo chi disegna la propria title bar: Electron/Chromium (Claude,
-  Cursor, 1Password, Chrome, Spotify, ...). Le native (Safari, Finder,
-  Impostazioni di Sistema, Terminal) non sono toccate.
+- It starts after remote or virtual input sessions (remote control, Universal
+  Control, Chrome Remote Desktop) and stays until WindowServer restarts.
+- It affects only apps that draw their own title bar: Electron/Chromium (Claude,
+  Cursor, 1Password, Chrome, Spotify, ...). Native apps (Safari, Finder,
+  System Settings, Terminal) are unaffected.
 
-Riferimenti: Apple Developer Forums thread 834488; Chromium issue 564169077.
+References: Apple Developer Forums thread 834488; Chromium issue 564169077.
 
-## Come funziona
+## How it works
 
-Un event tap (`CGEventTap`) intercetta il mouse. Quando premi e trascini nella
-fascia-titolo di una finestra, `macosdragfix` ne aggiorna la posizione via
-Accessibility API (`AXPosition`). L'AX NON passa per la gesture rotta, quindi il
-movimento funziona anche dove il drag nativo e bloccato. Un click secco viene
-lasciato all'app; sopra pulsanti/tab/campi di testo non interviene.
+An event tap (`CGEventTap`) watches the mouse. When you press and drag inside a
+window's title band, `macosdragfix` updates the window position through the
+Accessibility API (`AXPosition`). That path skips the broken gesture, so the
+window moves even where native drag is stuck. A plain click is passed through
+to the app. Over buttons, tabs, and text fields the tool stays out of the way.
 
-## Requisiti
+## Requirements
 
-- macOS su Apple Silicon.
-- Toolchain Swift (Command Line Tools: `xcode-select --install`).
+- macOS on Apple Silicon.
+- Swift toolchain (Command Line Tools: `xcode-select --install`).
 
 ## Build
 
     swiftc -O -o macosdragfix macosdragfix.swift \
       -framework ApplicationServices -framework CoreGraphics
 
-## Installazione
+## Installation
 
-1. Il comando e gia su PATH via symlink: `~/bin/macosdragfix -> questo progetto`.
-2. Primo avvio e permesso Accessibilita:
+1. The command is already on PATH via a symlink: `~/bin/macosdragfix` points at
+   this project.
+2. First launch and the Accessibility permission:
 
        macosdragfix
 
-   Concedi l'accesso in Impostazioni di Sistema > Privacy e sicurezza >
-   Accessibilita (abilita la voce che compare), poi rilancia. Deve stampare
-   la riga `macosdragfix attivo ...`.
-3. Avvio automatico al login (LaunchAgent):
+   Grant access in System Settings > Privacy & Security > Accessibility (enable
+   the entry that appears), then relaunch. It should print
+   `macosdragfix active ...`.
+3. Start automatically at login (LaunchAgent):
 
        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/it.m6i.macosdragfix.plist
 
    Stop: `launchctl bootout gui/$(id -u)/it.m6i.macosdragfix`
    Log: `/tmp/macosdragfix.log`
 
-## Uso e opzioni
+## Usage and options
 
     macosdragfix [--xoffset N] [--yoffset N] [--band N] [--mod ctrl+cmd]
 
-| opzione        | short | default | significato                                   |
-|----------------|-------|---------|-----------------------------------------------|
-| `--xoffset N`  | `-x`  | 8       | px da tenere da sinistra e da destra          |
-| `--yoffset N`  | `-y`  | 6       | px da tenere dal bordo superiore              |
-| `--band N`     | `-b`  | 34      | altezza della fascia-titolo dal bordo sup.    |
-| `--mod M`      | `-m`  | nessuno | richiede un modificatore, es. `ctrl+cmd`      |
+| option        | short | default | meaning                                     |
+|---------------|-------|---------|---------------------------------------------|
+| `--xoffset N` | `-x`  | 10      | px to keep clear on the left and right      |
+| `--yoffset N` | `-y`  | 8       | px to keep clear from the top edge          |
+| `--band N`    | `-b`  | 34      | height of the title band from the top edge  |
+| `--mod M`     | `-m`  | none    | require a modifier, for example `ctrl+cmd`  |
 
-Fallback da env: `MACOSDRAGFIX_XOFFSET`, `MACOSDRAGFIX_YOFFSET`,
+Environment fallback: `MACOSDRAGFIX_XOFFSET`, `MACOSDRAGFIX_YOFFSET`,
 `MACOSDRAGFIX_BAND`, `MACOSDRAGFIX_MOD`.
 
-### Zona di drag attiva
+### Active drag zone
 
-Relativa all'angolo in alto a sinistra della finestra:
+Relative to the window's top-left corner:
 
-- orizzontale: da `xoffset` a `larghezza - xoffset` (esclude angoli e lati -> resize)
-- verticale: da `yoffset` a `band` (esclude la striscia superiore -> resize)
+- horizontal: from `xoffset` to `width - xoffset` (corners and side edges stay free for resize)
+- vertical: from `yoffset` to `band` (the top strip stays free for resize)
 
-Per impostare le opzioni al login, aggiungile all'array `ProgramArguments` del
-plist (vedi `it.m6i.macosdragfix.plist`).
+To set options at login, add them to the `ProgramArguments` array in the plist
+(see `it.m6i.macosdragfix.plist`).
 
-## Taratura e compromessi
+## Tuning and tradeoffs
 
-- Agisce sulla fascia alta di tutte le finestre; sulle native sposta comunque via
-  AX, senza conflitti (gli eventi di drag vengono consumati durante il movimento).
-- In Chrome la fascia alta e la barra delle tab: l'area vuota sposta la finestra,
-  trascinare una tab (controllo AX) viene lasciato all'app. Se "mangia" troppo,
-  abbassa `band` o alza `xoffset`.
-- L'albero AX delle app Electron e povero: il riconoscimento dei controlli non e
-  perfetto. Alza `band` se il contenuto trascinabile parte piu in basso.
-- Soglia di 4 px: un click secco passa sempre all'app, solo un drag vero muove.
+- It acts on the top band of every window. On native apps it still moves the
+  window through AX, and drag events are consumed only while the window is moving.
+- In Chrome the top band is the tab bar: empty space moves the window, and
+  dragging a tab (an AX control) is left to the app. If the tool grabs too much,
+  lower `band` or raise `xoffset`.
+- Electron apps expose a sparse AX tree, so control detection is imperfect.
+  Raise `band` when the draggable content starts lower.
+- A 4 px threshold: a plain click always reaches the app. Only a real drag moves
+  the window.
 
-## Disinstallazione
+## Uninstall
 
     launchctl bootout gui/$(id -u)/it.m6i.macosdragfix 2>/dev/null
     rm -f ~/Library/LaunchAgents/it.m6i.macosdragfix.plist ~/bin/macosdragfix
-    # e rimuovi la voce in Impostazioni > Privacy e sicurezza > Accessibilita
+    # then remove the entry in Settings > Privacy & Security > Accessibility
 
-## Note
+## Notes
 
-- E un workaround per un bug della beta, non una correzione del difetto. La cura
-  vera e una build fixata da Apple o l'uscita dal programma beta.
-- Strumenti collegati nel sistema: `wm-fix` (reset WindowManager/surface senza
-  logout), `gfx-reset` (reset surface GPU). Il logout resta il reset completo di
-  WindowServer.
+- This is a workaround for a beta bug. The real fix is a corrected build from
+  Apple, or leaving the beta program.
+- Related tools on this system: `wm-fix` (reset WindowManager/surface without
+  logging out), `gfx-reset` (GPU surface reset). Logging out is still the full
+  WindowServer reset.

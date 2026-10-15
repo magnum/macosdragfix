@@ -1,81 +1,79 @@
 # AGENTS.md
 
-Guida per agenti AI e contributori che lavorano su questo repo.
+Guide for AI agents and contributors working on this repo.
 
-## Scopo
+## Purpose
 
-`macosdragfix` e un singolo binario Swift che ridate lo spostamento finestre su
-macOS 27 beta, dove il drag della title bar e rotto per le app a chrome custom
-(Electron/Chromium). Non corregge il bug di sistema: lo aggira spostando le
-finestre via Accessibility API invece che via la gesture di WindowServer.
+`macosdragfix` is a single Swift binary that restores window dragging on the
+macOS 27 beta, where title-bar drag is broken for apps with a custom chrome
+(Electron/Chromium). It works around the system bug by moving windows through
+the Accessibility API, skipping the broken WindowServer gesture.
 
-## Struttura
+## Layout
 
-- `macosdragfix.swift` - unico sorgente (nessuna dipendenza esterna).
-- `macosdragfix` - binario compilato.
-- `it.m6i.macosdragfix.plist` - template LaunchAgent (avvio al login).
-- `README.md` - documentazione utente.
+- `macosdragfix.swift` — the only source file (no external dependencies).
+- `macosdragfix` — the compiled binary.
+- `it.m6i.macosdragfix.plist` — LaunchAgent template (start at login).
+- `README.md` — user documentation.
 
-Il comando e esposto su PATH da `~/bin/macosdragfix` (symlink al binario qui).
+The command is on PATH as `~/bin/macosdragfix` (a symlink to the binary here).
 
-## Build e run
+## Build and run
 
     swiftc -O -o macosdragfix macosdragfix.swift \
       -framework ApplicationServices -framework CoreGraphics
-    ./macosdragfix --xoffset 8 --yoffset 6
+    ./macosdragfix --xoffset 10 --yoffset 8
 
-Non c'e suite di test automatica: la verifica e manuale (vedi sotto).
+There is no automated test suite. Verification is manual (see below).
 
-## Come funziona (invarianti da NON rompere)
+## How it works (invariants to keep)
 
-- Event tap `cgSessionEventTap` su leftMouseDown/Dragged/Up. Richiede il permesso
-  Accessibilita per esistere.
-- Coordinate: `CGEvent.location` e le `AXPosition`/`AXSize` condividono l'origine
-  in alto a sinistra del display principale. Nessun flip dell'asse Y.
-- Il mouseDown NON viene mai consumato: un click deve sempre arrivare all'app.
-  Si consuma solo il leftMouseDragged mentre si sta effettivamente spostando.
-- Soglia `threshold` (4 px): si entra in "moving" solo dopo un movimento reale,
-  cosi un click secco non sposta nulla.
-- Si ignora il down se l'elemento AX sotto il cursore ha un ruolo interattivo
-  (`interactiveRoles`: AXButton, AXTextField, AXTab-like, ...): niente hijack di
-  pulsanti/tab/campi.
-- Zona attiva relativa alla finestra: x in [xoffset, width-xoffset],
-  y in [yoffset, band]. Esclude bordo superiore e angoli (zone di resize).
-- Lo spostamento usa `AXUIElementSetAttributeValue(win, kAXPositionAttribute)`.
-  Questo e il punto chiave: bypassa la gesture rotta, quindi funziona sulle app
-  Electron.
+- Event tap `cgSessionEventTap` on leftMouseDown/Dragged/Up. It exists only with
+  the Accessibility permission.
+- Coordinates: `CGEvent.location` and `AXPosition`/`AXSize` share an origin at
+  the top-left of the main display. The Y axis stays as-is.
+- mouseDown is always delivered: a click must reach the app. Only
+  leftMouseDragged is consumed, and only while a move is actually in progress.
+- `threshold` (4 px): "moving" starts only after real movement, so a plain click
+  moves nothing.
+- A down is ignored when the AX element under the cursor has an interactive role
+  (`interactiveRoles`: AXButton, AXTextField, AXTab-like, ...), so buttons, tabs,
+  and fields stay with the app.
+- Active zone, relative to the window: x in [xoffset, width-xoffset],
+  y in [yoffset, band]. The top edge and the corners (resize zones) stay out.
+- Movement uses `AXUIElementSetAttributeValue(win, kAXPositionAttribute)`.
+  That is the key: it bypasses the broken gesture, so it works on Electron apps.
 
-## Parametri
+## Parameters
 
-CLI `--xoffset/-x`, `--yoffset/-y`, `--band/-b`, `--mod/-m`; fallback env
-`MACOSDRAGFIX_{XOFFSET,YOFFSET,BAND,MOD}`. CLI vince sull'env. `--mod` vuoto =
-nessun modificatore richiesto.
+CLI `--xoffset/-x`, `--yoffset/-y`, `--band/-b`, `--mod/-m`; environment
+fallback `MACOSDRAGFIX_{XOFFSET,YOFFSET,BAND,MOD}`. CLI wins over the
+environment. An empty `--mod` means no modifier is required.
 
-## Verifica manuale di una modifica
+## Manual check after a change
 
-1. Ricompila. Il recompile cambia il cdhash: potrebbe servire riconcedere
-   Accessibilita (TCC lega il permesso all'identita del binario non firmato).
-2. Avvia da terminale, controlla la riga di stato su stderr con i parametri.
-3. Test drag su una app Electron (Claude, Cursor) e una nativa (Safari):
-   entrambe devono spostarsi trascinando la fascia alta.
-4. Test non-regressione: un click su un pulsante/tab nella fascia alta deve
-   ancora funzionare (il tool si fa da parte).
-5. Se serve ispezionare il comportamento di WindowServer:
+1. Rebuild. A rebuild changes the cdhash: Accessibility may need to be granted
+   again (TCC binds the permission to the unsigned binary's identity).
+2. Launch from a terminal and check the status line on stderr for the parameters.
+3. Drag test on an Electron app (Claude, Cursor) and a native app (Safari):
+   both must move when dragging the top band.
+4. Regression test: a click on a button or tab in the top band must still work
+   (the tool steps aside).
+5. To inspect WindowServer behavior:
    `log show --last 60s --predicate 'process == "WindowServer"' --style compact | grep "drag trait"`
 
-## Gotcha
+## Gotchas
 
-- Binario non firmato: ogni rebuild puo richiedere di riabilitare la voce in
-  Impostazioni > Privacy e sicurezza > Accessibilita.
-- L'albero AX delle app Electron e minimale: il filtro `interactiveRoles` puo
-  non vedere alcuni controlli. In caso, preferire aggiustare `band`/`xoffset`
-  piuttosto che allargare gli hijack.
-- Non introdurre il consumo del mouseDown: romperebbe i click ovunque.
-- Mantenere le dipendenze a zero (solo framework di sistema) e il tutto in un
-  singolo file: e un workaround, deve restare semplice e ricompilabile ovunque.
+- Unsigned binary: every rebuild can require re-enabling the entry in
+  Settings > Privacy & Security > Accessibility.
+- Electron AX trees are sparse: the `interactiveRoles` filter can miss some
+  controls. Prefer adjusting `band`/`xoffset` over widening what gets hijacked.
+- Consuming mouseDown would break clicks everywhere. Leave it delivered.
+- Keep dependencies at zero (system frameworks only) and keep everything in one
+  file: this is a workaround, and it should stay simple and rebuildable anywhere.
 
-## Contesto
+## Context
 
-Target reale: un MacBook Pro M5 Max (Mac17,7) su macOS 27.x beta. Il bug a monte
-e tracciato in Apple Developer Forums 834488 e Chromium 564169077. Quando Apple
-rilascera una build fixata, questo tool diventa superfluo.
+Real target: a MacBook Pro M5 Max (Mac17,7) on macOS 27.x beta. The upstream bug
+is tracked in Apple Developer Forums 834488 and Chromium 564169077. Once Apple
+ships a fixed build, this tool is no longer needed.

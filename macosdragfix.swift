@@ -1,22 +1,22 @@
-// macosdragfix — sposta una finestra trascinando nella sua fascia-titolo, SENZA modificatori.
-// Workaround per il bug di drag della title bar su macOS 27 beta (muove via AX).
-// Zona attiva (relativa alla finestra): x in [xoffset, width-xoffset], y in [yoffset, band].
-// Esclude il bordo superiore (yoffset) e gli angoli/lati (xoffset) usati per il resize.
-// Click secco -> all'app. Su pulsanti/tab/campi non interviene.
+// macosdragfix — move a window by dragging its title band, with no modifiers.
+// Workaround for the title-bar drag bug on macOS 27 beta (moves via AX).
+// Active zone (relative to the window): x in [xoffset, width-xoffset], y in [yoffset, band].
+// Leaves the top edge (yoffset) and the corners/sides (xoffset) free for resize.
+// A plain click goes to the app. Over buttons, tabs, and fields it stays out.
 //
-// Uso: macosdragfix [--xoffset N] [--yoffset N] [--band N] [--mod ctrl+cmd]
-//   -x/--xoffset  px da tenere da sinistra e da destra   (def 8)
-//   -y/--yoffset  px da tenere dal bordo superiore        (def 6)
-//   -b/--band     altezza fascia-titolo dal bordo sup.    (def 34)
-//   -m/--mod      modificatore richiesto, es. ctrl+cmd    (def nessuno)
-// Fallback da env: MACOSDRAGFIX_XOFFSET, MACOSDRAGFIX_YOFFSET, MACOSDRAGFIX_BAND, MACOSDRAGFIX_MOD.
+// Usage: macosdragfix [--xoffset N] [--yoffset N] [--band N] [--mod ctrl+cmd]
+//   -x/--xoffset  px to keep clear on the left and right   (default 10)
+//   -y/--yoffset  px to keep clear from the top edge       (default 8)
+//   -b/--band     title-band height from the top edge      (default 34)
+//   -m/--mod      required modifier, e.g. ctrl+cmd         (default none)
+// Env fallback: MACOSDRAGFIX_XOFFSET, MACOSDRAGFIX_YOFFSET, MACOSDRAGFIX_BAND, MACOSDRAGFIX_MOD.
 import Foundation
 import ApplicationServices
 import CoreGraphics
 
 let env = ProcessInfo.processInfo.environment
-var xoffset = CGFloat(env["MACOSDRAGFIX_XOFFSET"].flatMap { Double($0) } ?? 8)
-var yoffset = CGFloat(env["MACOSDRAGFIX_YOFFSET"].flatMap { Double($0) } ?? 6)
+var xoffset = CGFloat(env["MACOSDRAGFIX_XOFFSET"].flatMap { Double($0) } ?? 10)
+var yoffset = CGFloat(env["MACOSDRAGFIX_YOFFSET"].flatMap { Double($0) } ?? 8)
 var band    = CGFloat(env["MACOSDRAGFIX_BAND"].flatMap { Double($0) } ?? 34)
 var modStr  = (env["MACOSDRAGFIX_MOD"] ?? "").lowercased()
 
@@ -103,14 +103,14 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
     let loc = event.location
     if !modOK(event.flags) { break }
     guard let h = hit(loc) else { break }
-    if let r = role(h), interactiveRoles.contains(r) { break }      // sopra un controllo: all'app
+    if let r = role(h), interactiveRoles.contains(r) { break }      // over a control: leave it to the app
     guard let w = climbToWindow(h), let (wp, ws) = frame(w) else { break }
     let relX = loc.x - wp.x, relY = loc.y - wp.y
-    if relY >= yoffset && relY <= band                             // sotto il bordo sup., dentro la fascia
-       && relX >= xoffset && relX <= (ws.width - xoffset) {        // lontano dai lati/angoli (resize)
+    if relY >= yoffset && relY <= band                             // below the top edge, inside the band
+       && relX >= xoffset && relX <= (ws.width - xoffset) {        // clear of the sides/corners (resize)
       candidate = true; win = w; winStart = wp; mouseStart = loc
     }
-    // non consumo il down: il click arriva all'app
+    // the down is delivered: the click reaches the app
   case .leftMouseDragged:
     if candidate, let w = win {
       let loc = event.location
@@ -130,10 +130,10 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
 _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
 guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
         options: .defaultTap, eventsOfInterest: mask, callback: cb, userInfo: nil) else {
-  FileHandle.standardError.write("macosdragfix: event tap non creato — manca Accessibilita?\n".data(using: .utf8)!); exit(1)
+  FileHandle.standardError.write("macosdragfix: event tap not created — Accessibility permission missing?\n".data(using: .utf8)!); exit(1)
 }
 CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
-let modNote = modStr.isEmpty ? "nessun tasto" : modStr
-FileHandle.standardError.write("macosdragfix attivo — xoffset=\(Int(xoffset)) yoffset=\(Int(yoffset)) band=\(Int(band)) mod=\(modNote)\n".data(using: .utf8)!)
+let modNote = modStr.isEmpty ? "none" : modStr
+FileHandle.standardError.write("macosdragfix active — xoffset=\(Int(xoffset)) yoffset=\(Int(yoffset)) band=\(Int(band)) mod=\(modNote)\n".data(using: .utf8)!)
 CFRunLoopRun()

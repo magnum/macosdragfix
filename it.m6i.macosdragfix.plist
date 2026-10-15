@@ -6,8 +6,8 @@
   <key>ProgramArguments</key>
   <array>
     <string>/Users/magnum/projects/macosdragfix/macosdragfix</string>
-    <string>--xoffset</string><string>8</string>
-    <string>--yoffset</string><string>6</string>
+    <string>--xoffset</string><string>10</string>
+    <string>--yoffset</string><string>8</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
