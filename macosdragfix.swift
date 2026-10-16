@@ -2,7 +2,9 @@
 // Workaround for the title-bar drag bug on macOS 27 beta (moves via AX).
 // Active zone (relative to the window): x in [xoffset, width-xoffset], y in [yoffset, band].
 // Leaves the top edge (yoffset) and the corners/sides (xoffset) free for resize.
-// A plain click goes to the app. Over buttons, tabs, and fields it stays out.
+// A plain click goes to the app. Over buttons, tabs, and fields it stays out,
+// including when the hit is a label inside that control.
+// ~/.macosdragfix.yml lists extra exclusion areas per app (created if missing).
 //
 // Usage: macosdragfix [--xoffset N] [--yoffset N] [--band N] [--mod ctrl+cmd]
 //   -x/--xoffset  px to keep clear on the left and right   (default 10)
@@ -39,13 +41,218 @@ let threshold: CGFloat = 4
 let interactiveRoles: Set<String> = [
   "AXButton","AXMenuButton","AXPopUpButton","AXRadioButton","AXCheckBox",
   "AXTextField","AXTextArea","AXSlider","AXComboBox","AXLink","AXStepper",
-  "AXDisclosureTriangle","AXSegmentedControl","AXSearchField","AXMenuItem"
+  "AXDisclosureTriangle","AXSegmentedControl","AXSearchField","AXMenuItem",
+  "AXTabGroup","AXTabButton","AXTab","AXPageTab"
 ]
+
+@_silgen_name("proc_pidpath")
+func proc_pidpath(_ pid: Int32, _ buffer: UnsafeMutableRawPointer, _ buffersize: UInt32) -> Int32
+
+struct ExcludeArea {
+  var name = ""
+  var x: CGFloat = 0
+  var y: CGFloat = 0
+  var width: CGFloat?
+  var height: CGFloat?
+  var right: CGFloat?
+  var bottom: CGFloat?
+  func contains(_ p: CGPoint, _ size: CGSize) -> Bool {
+    let w = width ?? max(0, size.width - x - (right ?? 0))
+    let h = height ?? max(0, size.height - y - (bottom ?? 0))
+    return p.x >= x && p.y >= y && p.x < x + w && p.y < y + h
+  }
+}
+struct AppRule {
+  var name: String
+  var bundle = ""
+  var xoffset: CGFloat?
+  var yoffset: CGFloat?
+  var band: CGFloat?
+  var exclude: [ExcludeArea] = []
+}
+
+let configPath = NSHomeDirectory() + "/.macosdragfix.yml"
+let defaultConfig = """
+# Per-app rules for macosdragfix. The key is the app name.
+# bundle is optional; a window matches the name or the bundle id.
+# Areas are points from the window's top-left.
+# right / bottom measure from the opposite edges when width / height are omitted.
+# band, xoffset, yoffset override the global values for that app.
+# A button, field, or tab that Accessibility exposes is always left to the app.
+# Edits apply on the next click.
+
+"1Password":
+  bundle: com.1password.1password
+  exclude:
+    - name: search
+      x: 248
+      y: 0
+      right: 8
+      height: 48
+
+"Google Chrome":
+  bundle: com.google.Chrome
+  exclude:
+    - name: tabs
+      x: 72
+      y: 0
+      right: 96
+      height: 40
+"""
+
+var appRules: [AppRule] = []
+var configMtime: Date?
+var idCache: [pid_t: (name: String, bundle: String)] = [:]
+
+func unquote(_ s: String) -> String {
+  if s.count >= 2, let a = s.first, let b = s.last,
+     (a == "\"" && b == "\"") || (a == "'" && b == "'") {
+    return String(s.dropFirst().dropLast())
+  }
+  return s
+}
+func splitKV(_ s: String) -> (String, String)? {
+  guard let i = s.firstIndex(of: ":") else { return nil }
+  let k = String(s[..<i]).trimmingCharacters(in: .whitespaces)
+  let v = String(s[s.index(after: i)...]).trimmingCharacters(in: .whitespaces)
+  return k.isEmpty ? nil : (k, v)
+}
+func applyArea(_ area: inout ExcludeArea, _ k: String, _ v: String) {
+  if k == "name" { area.name = unquote(v); return }
+  guard let n = Double(v) else { return }
+  switch k {
+  case "x": area.x = CGFloat(n)
+  case "y": area.y = CGFloat(n)
+  case "width": area.width = CGFloat(n)
+  case "height": area.height = CGFloat(n)
+  case "right": area.right = CGFloat(n)
+  case "bottom": area.bottom = CGFloat(n)
+  default: break
+  }
+}
+func parseConfig(_ text: String) -> [AppRule] {
+  var apps: [AppRule] = []
+  var inExclude = false
+  for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+    let line = String(raw)
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+    let indent = line.prefix { $0 == " " }.count
+    if indent == 0 {
+      inExclude = false
+      var name = trimmed
+      if name.hasSuffix(":") { name.removeLast() }
+      name = unquote(name.trimmingCharacters(in: .whitespaces))
+      if !name.isEmpty { apps.append(AppRule(name: name)) }
+      continue
+    }
+    guard !apps.isEmpty else { continue }
+    let i = apps.count - 1
+    if indent == 2 && trimmed == "exclude:" { inExclude = true; continue }
+    if indent == 2, let (k, v) = splitKV(trimmed) {
+      inExclude = false
+      switch k {
+      case "bundle": apps[i].bundle = unquote(v)
+      case "xoffset": if let n = Double(v) { apps[i].xoffset = CGFloat(n) }
+      case "yoffset": if let n = Double(v) { apps[i].yoffset = CGFloat(n) }
+      case "band": if let n = Double(v) { apps[i].band = CGFloat(n) }
+      default: break
+      }
+      continue
+    }
+    if inExclude && trimmed.hasPrefix("-") {
+      var area = ExcludeArea()
+      let rest = trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
+      if let (k, v) = splitKV(String(rest)) { applyArea(&area, k, v) }
+      apps[i].exclude.append(area)
+      continue
+    }
+    if inExclude, var area = apps[i].exclude.last, let (k, v) = splitKV(trimmed) {
+      applyArea(&area, k, v)
+      apps[i].exclude[apps[i].exclude.count - 1] = area
+    }
+  }
+  return apps
+}
+func loadConfigIfChanged() {
+  let fm = FileManager.default
+  if !fm.fileExists(atPath: configPath) {
+    do {
+      try defaultConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
+      FileHandle.standardError.write("macosdragfix: wrote \(configPath)\n".data(using: .utf8)!)
+    } catch {
+      FileHandle.standardError.write("macosdragfix: could not write \(configPath): \(error)\n".data(using: .utf8)!)
+    }
+  }
+  let mtime = (try? fm.attributesOfItem(atPath: configPath)[.modificationDate]) as? Date
+  if mtime == configMtime { return }
+  configMtime = mtime
+  let text = (try? String(contentsOfFile: configPath, encoding: .utf8)) ?? ""
+  appRules = parseConfig(text)
+}
+func appIdentity(_ e: AXUIElement) -> (name: String, bundle: String) {
+  var pid: pid_t = 0
+  AXUIElementGetPid(e, &pid)
+  if let hit = idCache[pid] { return hit }
+  var buf = [CChar](repeating: 0, count: 4096)
+  var name = ""
+  var bundle = ""
+  if proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 {
+    var url = URL(fileURLWithPath: String(cString: buf))
+    while url.path != "/" {
+      if url.pathExtension == "app" {
+        name = url.deletingPathExtension().lastPathComponent
+        let info = url.appendingPathComponent("Contents/Info.plist")
+        if let data = try? Data(contentsOf: info),
+           let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] {
+          bundle = plist["CFBundleIdentifier"] as? String ?? ""
+          if let n = plist["CFBundleName"] as? String, !n.isEmpty { name = n }
+        }
+        break
+      }
+      url.deleteLastPathComponent()
+    }
+  }
+  let pair = (name, bundle)
+  idCache[pid] = pair
+  return pair
+}
+func ruleFor(_ id: (name: String, bundle: String)) -> AppRule? {
+  for r in appRules {
+    if !r.bundle.isEmpty && r.bundle.caseInsensitiveCompare(id.bundle) == .orderedSame { return r }
+    if r.name.caseInsensitiveCompare(id.name) == .orderedSame { return r }
+  }
+  return nil
+}
 
 func role(_ e: AXUIElement) -> String? {
   var v: CFTypeRef?
   if AXUIElementCopyAttributeValue(e, kAXRoleAttribute as CFString, &v) == .success { return v as? String }
   return nil
+}
+func subrole(_ e: AXUIElement) -> String? {
+  var v: CFTypeRef?
+  if AXUIElementCopyAttributeValue(e, kAXSubroleAttribute as CFString, &v) == .success { return v as? String }
+  return nil
+}
+func parent(_ e: AXUIElement) -> AXUIElement? {
+  var v: CFTypeRef?
+  if AXUIElementCopyAttributeValue(e, kAXParentAttribute as CFString, &v) == .success,
+     let p = v, CFGetTypeID(p) == AXUIElementGetTypeID() { return (p as! AXUIElement) }
+  return nil
+}
+func yieldsToApp(_ start: AXUIElement) -> Bool {
+  var e = start
+  for _ in 0..<12 {
+    if let r = role(e) {
+      if r == "AXWindow" || r == "AXApplication" { return false }
+      if interactiveRoles.contains(r) { return true }
+    }
+    if let s = subrole(e), interactiveRoles.contains(s) { return true }
+    guard let p = parent(e) else { return false }
+    e = p
+  }
+  return false
 }
 func hit(_ p: CGPoint) -> AXUIElement? {
   var e: AXUIElement?
@@ -90,6 +297,40 @@ func modOK(_ f: CGEventFlags) -> Bool {
 var candidate = false, moving = false
 var win: AXUIElement?
 var winStart = CGPoint.zero, mouseStart = CGPoint.zero
+var tapPort: CFMachPort?
+
+// AX position updates are synchronous in the target app. Chrome on an external
+// display often answers slower than the mouse event rate; doing that work inside
+// the event tap stalls the pointer. Apply only the newest point, off the tap.
+let moveQueue = DispatchQueue(label: "it.m6i.macosdragfix.move", qos: .userInteractive)
+let moveLock = NSLock()
+var pendingWin: AXUIElement?
+var pendingPos: CGPoint?
+var moveBusy = false
+
+func requestMove(_ w: AXUIElement, _ p: CGPoint) {
+  moveLock.lock()
+  pendingWin = w
+  pendingPos = p
+  let start = !moveBusy
+  if start { moveBusy = true }
+  moveLock.unlock()
+  if start { moveQueue.async { drainMoves() } }
+}
+
+func drainMoves() {
+  while true {
+    moveLock.lock()
+    guard let w = pendingWin, let p = pendingPos else {
+      moveBusy = false
+      moveLock.unlock()
+      return
+    }
+    pendingPos = nil
+    moveLock.unlock()
+    setPos(w, p)
+  }
+}
 
 let mask: CGEventMask =
   (1 << CGEventType.leftMouseDown.rawValue) |
@@ -97,26 +338,40 @@ let mask: CGEventMask =
   (1 << CGEventType.leftMouseUp.rawValue)
 
 let cb: CGEventTapCallBack = { _, type, event, _ in
+  if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+    if let tapPort { CGEvent.tapEnable(tap: tapPort, enable: true) }
+    return nil
+  }
   switch type {
   case .leftMouseDown:
     candidate = false; moving = false; win = nil
     let loc = event.location
     if !modOK(event.flags) { break }
     guard let h = hit(loc) else { break }
-    if let r = role(h), interactiveRoles.contains(r) { break }      // over a control: leave it to the app
+    if yieldsToApp(h) { break }                                     // control, or a label inside one
     guard let w = climbToWindow(h), let (wp, ws) = frame(w) else { break }
+    loadConfigIfChanged()
+    let rule = ruleFor(appIdentity(w))
+    let xo = rule?.xoffset ?? xoffset
+    let yo = rule?.yoffset ?? yoffset
+    let bd = rule?.band ?? band
     let relX = loc.x - wp.x, relY = loc.y - wp.y
-    if relY >= yoffset && relY <= band                             // below the top edge, inside the band
-       && relX >= xoffset && relX <= (ws.width - xoffset) {        // clear of the sides/corners (resize)
+    if relY >= yo && relY <= bd
+       && relX >= xo && relX <= (ws.width - xo) {
+      let rel = CGPoint(x: relX, y: relY)
+      if rule?.exclude.contains(where: { $0.contains(rel, ws) }) == true { break }
       candidate = true; win = w; winStart = wp; mouseStart = loc
     }
     // the down is delivered: the click reaches the app
   case .leftMouseDragged:
     if candidate, let w = win {
       let loc = event.location
-      if !moving && (abs(loc.x - mouseStart.x) + abs(loc.y - mouseStart.y) > threshold) { moving = true }
+      if !moving && (abs(loc.x - mouseStart.x) + abs(loc.y - mouseStart.y) > threshold) {
+        moving = true
+        AXUIElementSetMessagingTimeout(w, 1)   // don't let a stuck Chrome hold the mover for the default 6s
+      }
       if moving {
-        setPos(w, CGPoint(x: winStart.x + (loc.x - mouseStart.x), y: winStart.y + (loc.y - mouseStart.y)))
+        requestMove(w, CGPoint(x: winStart.x + (loc.x - mouseStart.x), y: winStart.y + (loc.y - mouseStart.y)))
         return nil
       }
     }
@@ -127,13 +382,26 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
   return Unmanaged.passRetained(event)
 }
 
-_ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+loadConfigIfChanged()
+if CommandLine.arguments.contains("--dump-config") {
+  for r in appRules {
+    let areas = r.exclude.map { $0.name.isEmpty ? "area" : $0.name }.joined(separator: ", ")
+    print("\(r.name) bundle=\(r.bundle.isEmpty ? "-" : r.bundle) exclude=[\(areas)]")
+  }
+  exit(0)
+}
+if !AXIsProcessTrusted() {
+  _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+  FileHandle.standardError.write("macosdragfix: waiting for Accessibility for this binary. Remove the old entry with −, then enable the new one. Toggling the existing switch does not update it.\n".data(using: .utf8)!)
+  while !AXIsProcessTrusted() { sleep(1) }
+}
 guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
         options: .defaultTap, eventsOfInterest: mask, callback: cb, userInfo: nil) else {
-  FileHandle.standardError.write("macosdragfix: event tap not created — Accessibility permission missing?\n".data(using: .utf8)!); exit(1)
+  FileHandle.standardError.write("macosdragfix: event tap not created after Accessibility was granted\n".data(using: .utf8)!); exit(1)
 }
+tapPort = tap
 CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
 let modNote = modStr.isEmpty ? "none" : modStr
-FileHandle.standardError.write("macosdragfix active — xoffset=\(Int(xoffset)) yoffset=\(Int(yoffset)) band=\(Int(band)) mod=\(modNote)\n".data(using: .utf8)!)
+FileHandle.standardError.write("macosdragfix active — xoffset=\(Int(xoffset)) yoffset=\(Int(yoffset)) band=\(Int(band)) mod=\(modNote) apps=\(appRules.count) config=\(configPath)\n".data(using: .utf8)!)
 CFRunLoopRun()

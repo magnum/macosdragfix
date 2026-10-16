@@ -40,6 +40,7 @@ to the app. Over buttons, tabs, and text fields the tool stays out of the way.
 
     swiftc -O -o macosdragfix macosdragfix.swift \
       -framework ApplicationServices -framework CoreGraphics
+    codesign --force --sign - --identifier it.m6i.macosdragfix macosdragfix
 
 ## Installation
 
@@ -82,6 +83,18 @@ Relative to the window's top-left corner:
 
 To set options at login, add them to the `ProgramArguments` array in the plist
 (see `it.m6i.macosdragfix.plist`).
+
+### Per-app exclusions
+
+`~/.macosdragfix.yml` is created on first launch. The app name is a top-level
+key. An exclusion is a rectangle in window points; a click there is left to the
+app. `right` and `bottom` measure from the opposite edges. `band`, `xoffset`,
+and `yoffset` override the globals for that app. Edits apply on the next click.
+
+Buttons, text fields, and tabs that Accessibility exposes are left to the app
+even when they are not listed. Chrome often exposes a tab as a control, but
+the label under the pointer is not one, and 1Password's search bar often is
+not a text field. The file covers those areas.
 
 ## Tuning and tradeoffs
 

@@ -22,6 +22,7 @@ The command is on PATH as `~/bin/macosdragfix` (a symlink to the binary here).
 
     swiftc -O -o macosdragfix macosdragfix.swift \
       -framework ApplicationServices -framework CoreGraphics
+    codesign --force --sign - --identifier it.m6i.macosdragfix macosdragfix
     ./macosdragfix --xoffset 10 --yoffset 8
 
 There is no automated test suite. Verification is manual (see below).
@@ -36,9 +37,12 @@ There is no automated test suite. Verification is manual (see below).
   leftMouseDragged is consumed, and only while a move is actually in progress.
 - `threshold` (4 px): "moving" starts only after real movement, so a plain click
   moves nothing.
-- A down is ignored when the AX element under the cursor has an interactive role
-  (`interactiveRoles`: AXButton, AXTextField, AXTab-like, ...), so buttons, tabs,
-  and fields stay with the app.
+- A down is ignored when the hit element or one of its parents (up to the
+  window) has an interactive role (`interactiveRoles`: AXButton, AXTextField,
+  AXTab, ...), so a label inside a button, tab, or field stays with the app.
+- `~/.macosdragfix.yml` (created if missing) holds per-app exclusion rectangles
+  and optional `band` / `xoffset` / `yoffset`. App name is the top-level key.
+  It is re-read when the file's modification time changes.
 - Active zone, relative to the window: x in [xoffset, width-xoffset],
   y in [yoffset, band]. The top edge and the corners (resize zones) stay out.
 - Movement uses `AXUIElementSetAttributeValue(win, kAXPositionAttribute)`.
@@ -64,8 +68,10 @@ environment. An empty `--mod` means no modifier is required.
 
 ## Gotchas
 
-- Unsigned binary: every rebuild can require re-enabling the entry in
-  Settings > Privacy & Security > Accessibility.
+- Ad-hoc signature only. `swiftc` leaves a linker signature, which TCC ignores:
+  always re-sign with the `codesign` line above. A rebuild still changes the
+  cdhash, so Accessibility must be granted again. Remove the old row with the
+  minus button. Toggling the existing switch keeps the previous binary.
 - Electron AX trees are sparse: the `interactiveRoles` filter can miss some
   controls. Prefer adjusting `band`/`xoffset` over widening what gets hijacked.
 - Consuming mouseDown would break clicks everywhere. Leave it delivered.
