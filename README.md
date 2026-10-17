@@ -1,12 +1,38 @@
 # macosdragfix
 
-Native workaround for the window-dragging bug in the macOS 27 (Golden Gate) beta:
-on this beta, dragging a window by its title bar stops working for apps with a
-custom chrome (Electron, Chromium, and similar), while native AppKit apps keep
-working.
+Native workaround for the window-dragging bug in the macOS 27 (Golden Gate) beta.
+On this beta, dragging a window by its title bar stops working for apps with a
+custom chrome (Electron, Chromium, and similar). `macosdragfix` moves any window
+by dragging its top band, with no modifier keys.
 
-`macosdragfix` lets you move any window by dragging its top band, with no
-modifier keys, bypassing the broken gesture entirely.
+Run the commands below from this directory.
+
+## Build
+
+    swiftc -O -o macosdragfix macosdragfix.swift \
+      -framework ApplicationServices -framework CoreGraphics
+    codesign --force --sign - --identifier it.m6i.macosdragfix macosdragfix
+
+Needs the Swift toolchain (`xcode-select --install`). After a rebuild, macOS
+treats the binary as new: in System Settings > Privacy & Security > Accessibility,
+remove the old `macosdragfix` row with the minus button and enable the new one.
+Toggling the existing switch keeps the previous binary.
+
+## Run
+
+Start in the background:
+
+    launchctl bootout gui/$(id -u)/it.m6i.macosdragfix 2>/dev/null; nohup ./macosdragfix >>/tmp/macosdragfix.log 2>&1 & disown
+
+Stop:
+
+    pkill -x macosdragfix
+
+The start command also unloads the login agent, so two copies are not running.
+Log: `/tmp/macosdragfix.log`. A successful start prints `macosdragfix active ...`.
+
+The first launch must be allowed under Accessibility, then started again with
+the command above.
 
 ## The bug
 
@@ -31,36 +57,11 @@ Accessibility API (`AXPosition`). That path skips the broken gesture, so the
 window moves even where native drag is stuck. A plain click is passed through
 to the app. Over buttons, tabs, and text fields the tool stays out of the way.
 
-## Requirements
+In Chrome the top band is the tab bar. Each tab, the new-tab button, and the
+traffic lights are read from the live accessibility frames, so the empty gap
+that moves the window grows and shrinks with the number of tabs.
 
-- macOS on Apple Silicon.
-- Swift toolchain (Command Line Tools: `xcode-select --install`).
-
-## Build
-
-    swiftc -O -o macosdragfix macosdragfix.swift \
-      -framework ApplicationServices -framework CoreGraphics
-    codesign --force --sign - --identifier it.m6i.macosdragfix macosdragfix
-
-## Installation
-
-1. The command is already on PATH via a symlink: `~/bin/macosdragfix` points at
-   this project.
-2. First launch and the Accessibility permission:
-
-       macosdragfix
-
-   Grant access in System Settings > Privacy & Security > Accessibility (enable
-   the entry that appears), then relaunch. It should print
-   `macosdragfix active ...`.
-3. Start automatically at login (LaunchAgent):
-
-       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/it.m6i.macosdragfix.plist
-
-   Stop: `launchctl bootout gui/$(id -u)/it.m6i.macosdragfix`
-   Log: `/tmp/macosdragfix.log`
-
-## Usage and options
+## Options
 
     macosdragfix [--xoffset N] [--yoffset N] [--band N] [--mod ctrl+cmd]
 
@@ -81,9 +82,6 @@ Relative to the window's top-left corner:
 - horizontal: from `xoffset` to `width - xoffset` (corners and side edges stay free for resize)
 - vertical: from `yoffset` to `band` (the top strip stays free for resize)
 
-To set options at login, add them to the `ProgramArguments` array in the plist
-(see `it.m6i.macosdragfix.plist`).
-
 ### Per-app exclusions
 
 `~/.macosdragfix.yml` is created on first launch. The app name is a top-level
@@ -92,25 +90,34 @@ app. `right` and `bottom` measure from the opposite edges. `band`, `xoffset`,
 and `yoffset` override the globals for that app. Edits apply on the next click.
 
 Buttons, text fields, and tabs that Accessibility exposes are left to the app
-even when they are not listed. Chrome often exposes a tab as a control, but
-the label under the pointer is not one, and 1Password's search bar often is
-not a text field. The file covers those areas.
+even when they are not listed. Chrome tabs are measured from the live tab
+frames. 1Password's search bar is an exclusion in the file, because it often
+is not exposed as a text field.
 
-## Tuning and tradeoffs
+### Tuning
 
 - It acts on the top band of every window. On native apps it still moves the
   window through AX, and drag events are consumed only while the window is moving.
-- In Chrome the top band is the tab bar. Each tab, the new-tab button, and
-  the traffic lights are read from the live accessibility frames, so the empty
-  gap that moves the window grows and shrinks with the number of tabs.
 - Electron apps expose a sparse AX tree, so control detection is imperfect.
   Raise `band` when the draggable content starts lower.
 - A 4 px threshold: a plain click always reaches the app. Only a real drag moves
   the window.
 
+## Start at login
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/it.m6i.macosdragfix.plist
+
+Stop: `launchctl bootout gui/$(id -u)/it.m6i.macosdragfix`
+
+To set options at login, add them to the `ProgramArguments` array in
+`it.m6i.macosdragfix.plist`. The background command above is the one that
+keeps working after an ad-hoc rebuild; the login agent often does not receive
+the Accessibility grant for the new binary.
+
 ## Uninstall
 
     launchctl bootout gui/$(id -u)/it.m6i.macosdragfix 2>/dev/null
+    pkill -x macosdragfix
     rm -f ~/Library/LaunchAgents/it.m6i.macosdragfix.plist ~/bin/macosdragfix
     # then remove the entry in Settings > Privacy & Security > Accessibility
 
