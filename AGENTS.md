@@ -43,6 +43,9 @@ There is no automated test suite. Verification is manual (see below).
 - `~/.macosdragfix.yml` (created if missing) holds per-app exclusion rectangles
   and optional `band` / `xoffset` / `yoffset`. App name is the top-level key.
   It is re-read when the file's modification time changes.
+- Chrome tabs are not a fixed rectangle. On mouse down the top band is scanned
+  for tab and button frames, and only those frames stay with Chrome. The empty
+  gap is the drag region and follows the open tabs.
 - Active zone, relative to the window: x in [xoffset, width-xoffset],
   y in [yoffset, band]. The top edge and the corners (resize zones) stay out.
 - Movement uses `AXUIElementSetAttributeValue(win, kAXPositionAttribute)`.

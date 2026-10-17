@@ -100,9 +100,9 @@ not a text field. The file covers those areas.
 
 - It acts on the top band of every window. On native apps it still moves the
   window through AX, and drag events are consumed only while the window is moving.
-- In Chrome the top band is the tab bar: empty space moves the window, and
-  dragging a tab (an AX control) is left to the app. If the tool grabs too much,
-  lower `band` or raise `xoffset`.
+- In Chrome the top band is the tab bar. Each tab, the new-tab button, and
+  the traffic lights are read from the live accessibility frames, so the empty
+  gap that moves the window grows and shrinks with the number of tabs.
 - Electron apps expose a sparse AX tree, so control detection is imperfect.
   Raise `band` when the draggable content starts lower.
 - A 4 px threshold: a plain click always reaches the app. Only a real drag moves

@@ -42,7 +42,7 @@ let interactiveRoles: Set<String> = [
   "AXButton","AXMenuButton","AXPopUpButton","AXRadioButton","AXCheckBox",
   "AXTextField","AXTextArea","AXSlider","AXComboBox","AXLink","AXStepper",
   "AXDisclosureTriangle","AXSegmentedControl","AXSearchField","AXMenuItem",
-  "AXTabGroup","AXTabButton","AXTab","AXPageTab"
+  "AXTabButton","AXTab","AXPageTab"
 ]
 
 @_silgen_name("proc_pidpath")
@@ -90,14 +90,9 @@ let defaultConfig = """
       right: 8
       height: 48
 
-"Google Chrome":
-  bundle: com.google.Chrome
-  exclude:
-    - name: tabs
-      x: 72
-      y: 0
-      right: 96
-      height: 40
+# Chrome tabs are measured from the live tab strip, so the empty
+# title-bar area grows and shrinks with the open tabs. Add an exclude
+# only for a control Accessibility does not report.
 """
 
 var appRules: [AppRule] = []
@@ -254,6 +249,58 @@ func yieldsToApp(_ start: AXUIElement) -> Bool {
   }
   return false
 }
+func children(_ e: AXUIElement) -> [AXUIElement] {
+  var v: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(e, kAXChildrenAttribute as CFString, &v) == .success, let v else { return [] }
+  if let a = v as? [AXUIElement], !a.isEmpty { return a }
+  guard CFGetTypeID(v) == CFArrayGetTypeID() else { return [] }
+  let arr = v as! CFArray
+  var out: [AXUIElement] = []
+  for i in 0..<CFArrayGetCount(arr) {
+    if let p = CFArrayGetValueAtIndex(arr, i) {
+      out.append(Unmanaged<AXUIElement>.fromOpaque(p).takeUnretainedValue())
+    }
+  }
+  return out
+}
+func isChrome(_ id: (name: String, bundle: String)) -> Bool {
+  if id.bundle.hasPrefix("com.google.Chrome") { return true }
+  return id.name.caseInsensitiveCompare("Google Chrome") == .orderedSame
+}
+// Real tab and button frames in the title band. The tab strip group itself is
+// wider than a tab, so the empty gap after the last tab stays draggable and
+// follows how many tabs are open. Chrome nests the radios several groups deep.
+func chromeOccupied(_ window: AXUIElement, _ origin: CGPoint, _ size: CGSize, _ bandH: CGFloat) -> [CGRect] {
+  AXUIElementSetMessagingTimeout(window, 0.4)
+  var rects: [CGRect] = []
+  var queue: [(AXUIElement, Int)] = [(window, 0)]
+  var qi = 0
+  var seen = 0
+  let maxW = min(380, max(120, size.width * 0.7))
+  while qi < queue.count && seen < 200 && rects.count < 64 {
+    let (e, depth) = queue[qi]
+    qi += 1
+    seen += 1
+    if depth > 12 { continue }
+    let r = role(e) ?? ""
+    if r == "AXWebArea" || r == "AXTextArea" { continue }
+    var below = false
+    if let (p, s) = frame(e), s.width > 1, s.height > 1 {
+      let relY = p.y - origin.y
+      if relY > bandH + 4 { below = true }
+      let inBand = relY + s.height > 0 && relY < bandH + 12
+      let tab = r == "AXRadioButton" || r == "AXTab" || r == "AXTabButton" || r == "AXPageTab" || r == "AXTabGroup"
+      let button = r == "AXButton" || r == "AXPopUpButton" || r == "AXMenuButton"
+      if inBand && (tab || button) && s.height < bandH + 30 && s.width < maxW {
+        rects.append(CGRect(x: p.x - 2, y: p.y - 2, width: s.width + 4, height: s.height + 4))
+        continue
+      }
+    }
+    if below || depth >= 12 { continue }
+    for c in children(e) { queue.append((c, depth + 1)) }
+  }
+  return rects
+}
 func hit(_ p: CGPoint) -> AXUIElement? {
   var e: AXUIElement?
   if AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &e) == .success { return e }
@@ -351,7 +398,8 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
     if yieldsToApp(h) { break }                                     // control, or a label inside one
     guard let w = climbToWindow(h), let (wp, ws) = frame(w) else { break }
     loadConfigIfChanged()
-    let rule = ruleFor(appIdentity(w))
+    let id = appIdentity(w)
+    let rule = ruleFor(id)
     let xo = rule?.xoffset ?? xoffset
     let yo = rule?.yoffset ?? yoffset
     let bd = rule?.band ?? band
@@ -360,6 +408,7 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
        && relX >= xo && relX <= (ws.width - xo) {
       let rel = CGPoint(x: relX, y: relY)
       if rule?.exclude.contains(where: { $0.contains(rel, ws) }) == true { break }
+      if isChrome(id), chromeOccupied(w, wp, ws, bd).contains(where: { $0.contains(loc) }) { break }
       candidate = true; win = w; winStart = wp; mouseStart = loc
     }
     // the down is delivered: the click reaches the app
