@@ -1,3 +1,4 @@
+import AppKit
 // macosdragfix — move a window by dragging its title band, with no modifiers.
 // Workaround for the title-bar drag bug on macOS 27 beta (moves via AX).
 // Active zone (relative to the window): x in [xoffset, width-xoffset], y in [yoffset, band].
@@ -331,6 +332,57 @@ func setPos(_ w: AXUIElement, _ p: CGPoint) {
   var pt = p
   if let v = AXValueCreate(.cgPoint, &pt) { AXUIElementSetAttributeValue(w, kAXPositionAttribute as CFString, v) }
 }
+func setSize(_ w: AXUIElement, _ sz: CGSize) {
+  var s = sz
+  if let v = AXValueCreate(.cgSize, &s) { AXUIElementSetAttributeValue(w, kAXSizeAttribute as CFString, v) }
+}
+// Mouse released within snapEdge px of a screen edge: left/right half, top = fill. Returns AX (top-left) coords.
+let snapEdge: CGFloat = 4
+func snapRect(_ loc: CGPoint) -> CGRect? {
+  guard let mainH = NSScreen.screens.first?.frame.height else { return nil }
+  for sc in NSScreen.screens {
+    let f = sc.frame, v = sc.visibleFrame
+    let full = CGRect(x: f.minX, y: mainH - f.maxY, width: f.width, height: f.height)  // flip to top-left
+    guard full.insetBy(dx: -1, dy: -1).contains(loc) else { continue }
+    let vis = CGRect(x: v.minX, y: mainH - v.maxY, width: v.width, height: v.height)
+    if loc.x <= full.minX + snapEdge { return CGRect(x: vis.minX, y: vis.minY, width: vis.width / 2, height: vis.height) }
+    if loc.x >= full.maxX - snapEdge { return CGRect(x: vis.midX, y: vis.minY, width: vis.width / 2, height: vis.height) }
+    if loc.y <= full.minY + snapEdge { return vis }
+    return nil
+  }
+  return nil
+}
+// Translucent preview shown while dragging over a snap edge (like native tiling hint).
+var overlay: NSWindow?
+func showOverlay(_ r: CGRect?) {
+  guard let r = r, let mainH = NSScreen.screens.first?.frame.height else { overlay?.orderOut(nil); return }
+  let f = CGRect(x: r.minX, y: mainH - r.maxY, width: r.width, height: r.height).insetBy(dx: 6, dy: 6)
+  if overlay == nil {
+    let w = NSWindow(contentRect: f, styleMask: .borderless, backing: .buffered, defer: false)
+    w.isOpaque = false; w.backgroundColor = .clear; w.level = .floating; w.ignoresMouseEvents = true
+    w.hasShadow = false; w.collectionBehavior = [.canJoinAllSpaces, .transient]
+    let v = NSView(); v.wantsLayer = true
+    v.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
+    v.layer?.borderColor = NSColor.white.withAlphaComponent(0.55).cgColor
+    v.layer?.borderWidth = 1; v.layer?.cornerRadius = 12
+    w.contentView = v; overlay = w
+  }
+  guard let w = overlay else { return }
+  if w.isVisible { if w.frame != f { NSAnimationContext.runAnimationGroup { $0.duration = 0.12; w.animator().setFrame(f, display: true) } } }
+  else { w.setFrame(f, display: true); w.alphaValue = 0; w.orderFrontRegardless(); w.animator().alphaValue = 1 }
+}
+// Ease-out glide from current frame to target; runs on moveQueue.
+func animate(_ w: AXUIElement, to r: CGRect) {
+  guard let (p0, s0) = frame(w) else { setPos(w, r.origin); setSize(w, r.size); return }
+  let steps = 10
+  for i in 1...steps {
+    let t = Double(i) / Double(steps), e = CGFloat(1 - pow(1 - t, 3))
+    setPos(w, CGPoint(x: p0.x + (r.minX - p0.x) * e, y: p0.y + (r.minY - p0.y) * e))
+    setSize(w, CGSize(width: s0.width + (r.width - s0.width) * e, height: s0.height + (r.height - s0.height) * e))
+    usleep(12_000)
+  }
+  setPos(w, r.origin); setSize(w, r.size); setPos(w, r.origin)
+}
 func modOK(_ f: CGEventFlags) -> Bool {
   if modStr.isEmpty { return true }
   var ok = true
@@ -421,10 +473,27 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
       }
       if moving {
         requestMove(w, CGPoint(x: winStart.x + (loc.x - mouseStart.x), y: winStart.y + (loc.y - mouseStart.y)))
+        showOverlay(snapRect(loc))
         return nil
       }
     }
   case .leftMouseUp:
+    // ponytail: Chrome snaps back to its cached frame on mouseUp; re-assert final position after it settles
+    if moving, let w = win {
+      let loc = event.location
+      let p = CGPoint(x: winStart.x + (loc.x - mouseStart.x), y: winStart.y + (loc.y - mouseStart.y))
+      let snap = snapRect(loc)
+      showOverlay(nil)
+      if let r = snap {
+        moveQueue.asyncAfter(deadline: .now() + .milliseconds(60)) { animate(w, to: r) }
+        moveQueue.asyncAfter(deadline: .now() + .milliseconds(400)) { setPos(w, r.origin); setSize(w, r.size) }
+      } else {
+        moveQueue.async { setPos(w, p) }
+        for ms in [16, 40, 80, 150, 250] { moveQueue.asyncAfter(deadline: .now() + .milliseconds(ms)) { setPos(w, p) } }
+      }
+      // ponytail: hand Chrome a release at the press point so it sees a plain click, not a drag it must undo
+      event.location = mouseStart
+    }
     candidate = false; moving = false; win = nil
   default: break
   }
@@ -449,6 +518,7 @@ guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEve
   FileHandle.standardError.write("macosdragfix: event tap not created after Accessibility was granted\n".data(using: .utf8)!); exit(1)
 }
 tapPort = tap
+NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
 let modNote = modStr.isEmpty ? "none" : modStr
