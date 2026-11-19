@@ -267,17 +267,26 @@ func isChrome(_ id: (name: String, bundle: String)) -> Bool {
   if id.bundle.hasPrefix("com.google.Chrome") { return true }
   return id.name.caseInsensitiveCompare("Google Chrome") == .orderedSame
 }
+func title(_ w: AXUIElement) -> String {
+  var v: CFTypeRef?
+  if AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &v) == .success { return v as? String ?? "" }
+  return ""
+}
 // Real tab and button frames in the title band. The tab strip group itself is
 // wider than a tab, so the empty gap after the last tab stays draggable and
 // follows how many tabs are open. Chrome nests the radios several groups deep.
-func chromeOccupied(_ window: AXUIElement, _ origin: CGPoint, _ size: CGSize, _ bandH: CGFloat) -> [CGRect] {
-  AXUIElementSetMessagingTimeout(window, 0.4)
+// Returns complete=false when the time budget ran out: the caller then declines
+// the drag rather than risk hijacking a tab the scan never saw.
+func chromeOccupied(_ window: AXUIElement, _ origin: CGPoint, _ size: CGSize, _ bandH: CGFloat) -> (rects: [CGRect], complete: Bool) {
+  AXUIElementSetMessagingTimeout(window, 0.15)
+  let deadline = Date().addingTimeInterval(0.6)
   var rects: [CGRect] = []
   var queue: [(AXUIElement, Int)] = [(window, 0)]
   var qi = 0
   var seen = 0
   let maxW = min(380, max(120, size.width * 0.7))
   while qi < queue.count && seen < 200 && rects.count < 64 {
+    if Date() > deadline { return (rects, false) }
     let (e, depth) = queue[qi]
     qi += 1
     seen += 1
@@ -299,7 +308,7 @@ func chromeOccupied(_ window: AXUIElement, _ origin: CGPoint, _ size: CGSize, _ 
     if below || depth >= 12 { continue }
     for c in children(e) { queue.append((c, depth + 1)) }
   }
-  return rects
+  return (rects, true)
 }
 let sysWide = AXUIElementCreateSystemWide()
 AXUIElementSetMessagingTimeout(sysWide, 0.25)   // a stuck app must not stall the hit test
@@ -358,22 +367,29 @@ var downSeq = 0
 let evalQueue = DispatchQueue(label: "it.m6i.macosdragfix.eval", qos: .userInteractive)
 
 // Repeated drag attempts rescan the same tab strip; cache the result briefly so
-// a slow Chrome tree cannot make every attempt expensive.
+// a slow Chrome tree cannot make every attempt expensive. The key includes the
+// window's AX title as identity, so a strip read for one window is never reused
+// for another, and an active-tab change (new title) forces a fresh scan.
 struct ScanKey: Hashable {
-  var pid: pid_t; var x: CGFloat; var y: CGFloat; var w: CGFloat; var h: CGFloat; var band: CGFloat
+  var pid: pid_t; var title: String; var x: CGFloat; var y: CGFloat; var w: CGFloat; var h: CGFloat; var band: CGFloat
 }
-struct ScanEntry { var rects: [CGRect]; var at: Date }
+struct ScanEntry { var rects: [CGRect]; var at: Date; var complete: Bool }
 var scanCache: [ScanKey: ScanEntry] = [:]
 
-func occupiedFor(_ w: AXUIElement, _ id: (name: String, bundle: String), _ wp: CGPoint, _ ws: CGSize, _ bd: CGFloat) -> [CGRect] {
+// Returns nil when the tab scan is incomplete: the caller declines the drag
+// rather than risk hijacking a tab the scan never saw.
+func occupiedFor(_ w: AXUIElement, _ id: (name: String, bundle: String), _ wp: CGPoint, _ ws: CGSize, _ bd: CGFloat) -> [CGRect]? {
   var pid: pid_t = 0
   AXUIElementGetPid(w, &pid)
-  let key = ScanKey(pid: pid, x: wp.x, y: wp.y, w: ws.width, h: ws.height, band: bd)
-  if let e = scanCache[key], Date().timeIntervalSince(e.at) < 1.5 { return e.rects }
-  let rects = isChrome(id) ? chromeOccupied(w, wp, ws, bd) : []
+  let key = ScanKey(pid: pid, title: title(w), x: wp.x, y: wp.y, w: ws.width, h: ws.height, band: bd)
+  if let e = scanCache[key], Date().timeIntervalSince(e.at) < 1.5 {
+    return e.complete ? e.rects : nil
+  }
+  guard isChrome(id) else { return [] }
+  let (rects, complete) = chromeOccupied(w, wp, ws, bd)
   if scanCache.count > 32 { scanCache.removeAll(keepingCapacity: true) }
-  scanCache[key] = ScanEntry(rects: rects, at: Date())
-  return rects
+  scanCache[key] = ScanEntry(rects: rects, at: Date(), complete: complete)
+  return complete ? rects : nil
 }
 
 // AX position updates are synchronous in the target app. Chrome on an external
@@ -430,7 +446,8 @@ func evaluateDown(_ loc: CGPoint, _ seq: Int) {
   guard relY >= yo && relY <= bd && relX >= xo && relX <= (ws.width - xo) else { return }
   let rel = CGPoint(x: relX, y: relY)
   if rule?.exclude.contains(where: { $0.contains(rel, ws) }) == true { return }
-  if occupiedFor(w, id, wp, ws, bd).contains(where: { $0.contains(loc) }) { return }
+  guard let occupied = occupiedFor(w, id, wp, ws, bd) else { return }
+  if occupied.contains(where: { $0.contains(loc) }) { return }
   stateLock.lock()
   if downSeq == seq { candidate = true; win = w; winStart = wp; mouseStart = loc }
   stateLock.unlock()
@@ -460,10 +477,23 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
       if mv || abs(loc.x - ms.x) + abs(loc.y - ms.y) > threshold {
         if !mv {
           AXUIElementSetMessagingTimeout(w, 1) // don't let a stuck Chrome hold the mover for the default 6s
-          stateLock.lock(); moving = true; stateLock.unlock()
+          // Anchor at this first qualifying drag point, not at the mouseDown:
+          // if classification finished after the gesture started, the window
+          // keeps moving from where it actually is instead of jumping to
+          // catch up with the pointer.
+          stateLock.lock()
+          moving = true
+          winStart = ws0
+          mouseStart = loc
+          stateLock.unlock()
         }
-        requestMove(w, CGPoint(x: ws0.x + (loc.x - ms.x), y: ws0.y + (loc.y - ms.y)))
-        return nil
+        stateLock.lock()
+        let aW = winStart, aM = mouseStart, nowMoving = moving
+        stateLock.unlock()
+        if nowMoving {
+          requestMove(w, CGPoint(x: aW.x + (loc.x - aM.x), y: aW.y + (loc.y - aM.y)))
+          return nil
+        }
       }
     }
   case .leftMouseUp:
