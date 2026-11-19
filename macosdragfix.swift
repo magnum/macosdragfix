@@ -301,9 +301,12 @@ func chromeOccupied(_ window: AXUIElement, _ origin: CGPoint, _ size: CGSize, _ 
   }
   return rects
 }
+let sysWide = AXUIElementCreateSystemWide()
+AXUIElementSetMessagingTimeout(sysWide, 0.25)   // a stuck app must not stall the hit test
+
 func hit(_ p: CGPoint) -> AXUIElement? {
   var e: AXUIElement?
-  if AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &e) == .success { return e }
+  if AXUIElementCopyElementAtPosition(sysWide, Float(p.x), Float(p.y), &e) == .success { return e }
   return nil
 }
 func climbToWindow(_ start: AXUIElement) -> AXUIElement? {
@@ -345,6 +348,33 @@ var candidate = false, moving = false
 var win: AXUIElement?
 var winStart = CGPoint.zero, mouseStart = CGPoint.zero
 var tapPort: CFMachPort?
+// The tap callback must never block: macOS silently disables an event tap whose
+// callback takes too long, and a disabled tap passes every drag through to the
+// broken WindowServer gesture. All AX work therefore runs on evalQueue; the
+// callback only touches these small flags, under stateLock. downSeq tags each
+// mouseDown so a slow evaluation cannot attach itself to a newer gesture.
+let stateLock = NSLock()
+var downSeq = 0
+let evalQueue = DispatchQueue(label: "it.m6i.macosdragfix.eval", qos: .userInteractive)
+
+// Repeated drag attempts rescan the same tab strip; cache the result briefly so
+// a slow Chrome tree cannot make every attempt expensive.
+struct ScanKey: Hashable {
+  var pid: pid_t; var x: CGFloat; var y: CGFloat; var w: CGFloat; var h: CGFloat; var band: CGFloat
+}
+struct ScanEntry { var rects: [CGRect]; var at: Date }
+var scanCache: [ScanKey: ScanEntry] = [:]
+
+func occupiedFor(_ w: AXUIElement, _ id: (name: String, bundle: String), _ wp: CGPoint, _ ws: CGSize, _ bd: CGFloat) -> [CGRect] {
+  var pid: pid_t = 0
+  AXUIElementGetPid(w, &pid)
+  let key = ScanKey(pid: pid, x: wp.x, y: wp.y, w: ws.width, h: ws.height, band: bd)
+  if let e = scanCache[key], Date().timeIntervalSince(e.at) < 1.5 { return e.rects }
+  let rects = isChrome(id) ? chromeOccupied(w, wp, ws, bd) : []
+  if scanCache.count > 32 { scanCache.removeAll(keepingCapacity: true) }
+  scanCache[key] = ScanEntry(rects: rects, at: Date())
+  return rects
+}
 
 // AX position updates are synchronous in the target app. Chrome on an external
 // display often answers slower than the mouse event rate; doing that work inside
@@ -384,6 +414,28 @@ let mask: CGEventMask =
   (1 << CGEventType.leftMouseDragged.rawValue) |
   (1 << CGEventType.leftMouseUp.rawValue)
 
+// Runs on evalQueue: the heavy AX work that used to run inside the tap callback.
+// Sets the candidate only if this down is still the newest one.
+func evaluateDown(_ loc: CGPoint, _ seq: Int) {
+  guard let h = hit(loc) else { return }
+  if yieldsToApp(h) { return }                                     // control, or a label inside one
+  guard let w = climbToWindow(h), let (wp, ws) = frame(w) else { return }
+  loadConfigIfChanged()
+  let id = appIdentity(w)
+  let rule = ruleFor(id)
+  let xo = rule?.xoffset ?? xoffset
+  let yo = rule?.yoffset ?? yoffset
+  let bd = rule?.band ?? band
+  let relX = loc.x - wp.x, relY = loc.y - wp.y
+  guard relY >= yo && relY <= bd && relX >= xo && relX <= (ws.width - xo) else { return }
+  let rel = CGPoint(x: relX, y: relY)
+  if rule?.exclude.contains(where: { $0.contains(rel, ws) }) == true { return }
+  if occupiedFor(w, id, wp, ws, bd).contains(where: { $0.contains(loc) }) { return }
+  stateLock.lock()
+  if downSeq == seq { candidate = true; win = w; winStart = wp; mouseStart = loc }
+  stateLock.unlock()
+}
+
 let cb: CGEventTapCallBack = { _, type, event, _ in
   if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
     if let tapPort { CGEvent.tapEnable(tap: tapPort, enable: true) }
@@ -391,41 +443,33 @@ let cb: CGEventTapCallBack = { _, type, event, _ in
   }
   switch type {
   case .leftMouseDown:
+    stateLock.lock()
     candidate = false; moving = false; win = nil
+    downSeq += 1
+    let seq = downSeq
+    stateLock.unlock()
     let loc = event.location
-    if !modOK(event.flags) { break }
-    guard let h = hit(loc) else { break }
-    if yieldsToApp(h) { break }                                     // control, or a label inside one
-    guard let w = climbToWindow(h), let (wp, ws) = frame(w) else { break }
-    loadConfigIfChanged()
-    let id = appIdentity(w)
-    let rule = ruleFor(id)
-    let xo = rule?.xoffset ?? xoffset
-    let yo = rule?.yoffset ?? yoffset
-    let bd = rule?.band ?? band
-    let relX = loc.x - wp.x, relY = loc.y - wp.y
-    if relY >= yo && relY <= bd
-       && relX >= xo && relX <= (ws.width - xo) {
-      let rel = CGPoint(x: relX, y: relY)
-      if rule?.exclude.contains(where: { $0.contains(rel, ws) }) == true { break }
-      if isChrome(id), chromeOccupied(w, wp, ws, bd).contains(where: { $0.contains(loc) }) { break }
-      candidate = true; win = w; winStart = wp; mouseStart = loc
-    }
+    if modOK(event.flags) { evalQueue.async { evaluateDown(loc, seq) } }
     // the down is delivered: the click reaches the app
   case .leftMouseDragged:
-    if candidate, let w = win {
+    stateLock.lock()
+    let cand = candidate, w = win, ms = mouseStart, ws0 = winStart, mv = moving
+    stateLock.unlock()
+    if cand, let w {
       let loc = event.location
-      if !moving && (abs(loc.x - mouseStart.x) + abs(loc.y - mouseStart.y) > threshold) {
-        moving = true
-        AXUIElementSetMessagingTimeout(w, 1)   // don't let a stuck Chrome hold the mover for the default 6s
-      }
-      if moving {
-        requestMove(w, CGPoint(x: winStart.x + (loc.x - mouseStart.x), y: winStart.y + (loc.y - mouseStart.y)))
+      if mv || abs(loc.x - ms.x) + abs(loc.y - ms.y) > threshold {
+        if !mv {
+          AXUIElementSetMessagingTimeout(w, 1) // don't let a stuck Chrome hold the mover for the default 6s
+          stateLock.lock(); moving = true; stateLock.unlock()
+        }
+        requestMove(w, CGPoint(x: ws0.x + (loc.x - ms.x), y: ws0.y + (loc.y - ms.y)))
         return nil
       }
     }
   case .leftMouseUp:
+    stateLock.lock()
     candidate = false; moving = false; win = nil
+    stateLock.unlock()
   default: break
   }
   return Unmanaged.passRetained(event)
@@ -442,7 +486,17 @@ if CommandLine.arguments.contains("--dump-config") {
 if !AXIsProcessTrusted() {
   _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
   FileHandle.standardError.write("macosdragfix: waiting for Accessibility for this binary. Remove the old entry with −, then enable the new one. Toggling the existing switch does not update it.\n".data(using: .utf8)!)
-  while !AXIsProcessTrusted() { sleep(1) }
+  var waited = 0
+  while !AXIsProcessTrusted() {
+    sleep(1); waited += 1
+    if waited == 10 {
+      // Some processes never see a grant made while they are running. Under
+      // launchd (KeepAlive) exiting here restarts us and the new process sees
+      // the grant; run manually, start the command again.
+      FileHandle.standardError.write("macosdragfix: Accessibility not visible after 10s; exiting so launchd restarts us\n".data(using: .utf8)!)
+      exit(0)
+    }
+  }
 }
 guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
         options: .defaultTap, eventsOfInterest: mask, callback: cb, userInfo: nil) else {
@@ -451,6 +505,28 @@ guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEve
 tapPort = tap
 CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
+
+// Watchdog: even with the heavy work off the callback, macOS can disable the
+// tap (timeout, user input). The callback handles the notification when it can,
+// but it only fires once — this timer notices a still-disabled tap and revives
+// it, so a wedged tap can never become "dragging quietly stopped working".
+let myPid = Int32(ProcessInfo.processInfo.processIdentifier)
+let watchdog = CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 2, 2, 0, 0) { _ in
+  guard let tapPort else { return }
+  var count: UInt32 = 0
+  CGGetEventTapList(0, nil, &count)
+  guard count > 0 else { return }
+  var taps = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(count))
+  CGGetEventTapList(count, &taps, &count)
+  for t in taps[..<Int(count)] where t.tappingProcess == myPid {
+    if t.eventsOfInterest == mask && !t.enabled {
+      CGEvent.tapEnable(tap: tapPort, enable: true)
+      FileHandle.standardError.write("macosdragfix: re-enabled a disabled event tap\n".data(using: .utf8)!)
+    }
+  }
+}
+CFRunLoopAddTimer(CFRunLoopGetCurrent(), watchdog, .commonModes)
+
 let modNote = modStr.isEmpty ? "none" : modStr
 FileHandle.standardError.write("macosdragfix active — xoffset=\(Int(xoffset)) yoffset=\(Int(yoffset)) band=\(Int(band)) mod=\(modNote) apps=\(appRules.count) config=\(configPath)\n".data(using: .utf8)!)
 CFRunLoopRun()
